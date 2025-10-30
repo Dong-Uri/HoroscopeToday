@@ -11,6 +11,7 @@ import re
 import time
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -93,7 +94,8 @@ def find_today_post_url():
         raise RuntimeError("목록에서 '오늘의 운세' 링크를 찾지 못했습니다.")
 
     # 오늘 날짜 우선 탐색
-    now = datetime.now()
+    # use KST (Asia/Seoul) so runs on servers in UTC still select the same "오늘" as Korea
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
     md = f"{now.month}월 {now.day}일"
     for a in anchors:
         txt = a.get_text(" ", strip=True)
