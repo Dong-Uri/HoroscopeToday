@@ -1,0 +1,45 @@
+name: daily-horoscope-gchat
+
+on:
+  schedule:
+    # 매일 23:00 UTC = KST(+9) 익일 08:00
+    - cron: "0 23 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # 동일 워크플로가 겹치지 않도록 (혹시 수동 실행과 스케줄이 겹칠 때)
+    concurrency:
+      group: daily-horoscope-gchat
+      cancel-in-progress: true
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: hashFiles('requirements.txt') != ''
+        run: pip install -r requirements.txt
+
+      # (선택) 포맷/린트 등 사전 체크가 필요하면 여기에 추가
+
+      - name: Run script (with simple retry)
+        env:
+          GCHAT_WEBHOOK: ${{ secrets.GCHAT_WEBHOOK }}
+        run: |
+          set -e
+          tries=3
+          for i in $(seq 1 $tries); do
+            echo "Attempt $i/$tries"
+            python horoscope.py && break || {
+              echo "Run failed (attempt $i). Retrying in 10s..."
+              sleep 10
+            }
+          done
