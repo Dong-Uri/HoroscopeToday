@@ -3,7 +3,7 @@ name: daily-horoscope-gchat
 on:
   schedule:
     # 매일 23:00 UTC = KST(+9) 익일 08:00
-    - cron: "0 23 * * *"
+    - cron: "50 22 * * *"
   workflow_dispatch: {}
 
 jobs:
