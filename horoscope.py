@@ -20,12 +20,13 @@ import urllib.robotparser as robotparser
 
 # ---------- 설정 ----------
 BASE = "https://askjiyun.com"
-LIST_URL = urljoin(BASE, "today")
+LIST_URL = urljoin(BASE, "?mid=today")
 TITLE_RE = re.compile(r"^오늘의 운세,\s*\d+월\s*\d+일")
 GCHAT_WEBHOOK = os.getenv("GCHAT_WEBHOOK")
 
 # 전송 최대 길이: 너무 길면 웹훅/채널에서 문제될 수 있으므로 안전하게 자름
 MAX_MESSAGE_LEN = 14000
+MAX_LIST_PAGES = 6  # 최대 몇 페이지까지 목록을 탐색할지 (1-based)
 
 # HTTP 헤더 (간단한 브라우저처럼)
 UA = {
@@ -70,41 +71,111 @@ def http_get(url, timeout=15, retry=3, backoff=1.2):
 
 # ---------- 목록에서 오늘 게시글 링크 찾기 ----------
 def find_today_post_url():
-    html = http_get(LIST_URL)
-    soup = BeautifulSoup(html, "html.parser")
+    """목록(여러 페이지)을 순회하며 '오늘의 운세' 게시글 URL을 찾습니다.
 
-    # 1) 제목 텍스트가 정확히 매칭되는 a 태그 찾기
-    anchors = soup.find_all("a", string=re.compile(r"^오늘의 운세,\s*\d+월\s*\d+일"))
-    if not anchors:
-        # 2) 텍스트 조합(공백/nbsp 등) 보정해서 찾기
-        anchors = []
-        for a in soup.find_all("a"):
-            txt = (a.get_text(" ", strip=True) or "").replace("\u00a0", " ")
-            if re.match(r"^오늘의 운세,\s*\d+월\s*\d+일", txt):
-                anchors.append(a)
+    동작 순서:
+    - page=1..MAX_LIST_PAGES 를 순회하며 anchors를 수집
+    - 각 페이지에서 오늘 날짜(Asia/Seoul 기준)가 포함된 링크가 있으면 즉시 반환
+    - 전체 수집 후에도 없다면 document_srl 값이 가장 큰(=최신) 링크를 선택
+    """
+    anchors = []
+    soup = None
+    for page in range(1, MAX_LIST_PAGES + 1):
+        if page == 1:
+            url = LIST_URL
+        else:
+            sep = '&' if '?' in LIST_URL else '?'
+            url = f"{LIST_URL}{sep}page={page}"
+        logging.debug("fetching list page %d: %s", page, url)
+        try:
+            html = http_get(url)
+        except Exception as e:
+            logging.warning("목록 페이지 가져오기 실패 (page %d): %s", page, e)
+            continue
+        soup = BeautifulSoup(html, "html.parser")
 
-    if not anchors:
-        # 3) 대체: 모든 링크에서 접두사로 시작하는 텍스트 검사
-        for a in soup.select("a"):
-            txt = (a.get_text(" ", strip=True) or "")
-            if txt.startswith("오늘의 운세,"):
-                anchors.append(a)
+        # 1) 제목 텍스트가 정확히 매칭되는 a 태그 찾기
+        page_anchors = soup.find_all("a", string=re.compile(r"^오늘의 운세,\s*\d{1,2}\s*월\s*\d{1,2}\s*일"))
+        if not page_anchors:
+            # 2) 텍스트 조합(공백/nbsp 등) 보정해서 찾기
+            page_anchors = []
+            for a in soup.find_all("a"):
+                txt = (a.get_text(" ", strip=True) or "").replace("\u00a0", " ")
+                if re.match(r"^오늘의 운세,\s*\d{1,2}\s*월\s*\d{1,2}\s*일", txt):
+                    page_anchors.append(a)
 
+        if not page_anchors:
+            # 3) 대체: 모든 링크에서 접두사로 시작하는 텍스트 검사
+            for a in soup.select("a"):
+                txt = (a.get_text(" ", strip=True) or "")
+                if txt.startswith("오늘의 운세,"):
+                    page_anchors.append(a)
+
+        if page_anchors:
+            logging.debug("found %d anchors on page %d", len(page_anchors), page)
+            anchors.extend(page_anchors)
+
+        # 페이지에서 오늘 날짜 우선 탐색 (KST 기준)
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+        date_re = re.compile(fr"{now.month}\s*월\s*{now.day}\s*일")
+        for a in page_anchors:
+            txt = a.get_text(" ", strip=True)
+            if date_re.search(txt):
+                href = a.get("href")
+                logging.debug("matched today on page %d: %s", page, href)
+                return urljoin(BASE, href)
+
+    # 모든 페이지를 돌았지만 오늘 링크를 못 찾음
     if not anchors:
         raise RuntimeError("목록에서 '오늘의 운세' 링크를 찾지 못했습니다.")
 
-    # 오늘 날짜 우선 탐색
-    # use KST (Asia/Seoul) so runs on servers in UTC still select the same "오늘" as Korea
+    # 디버그: 발견된 anchors 목록 로깅 (텍스트와 href)
+    logging.debug("found total %d anchors across pages for '오늘의 운세'", len(anchors))
+    for i, a in enumerate(anchors[:60]):
+        try:
+            logging.debug("anchor[%d]: text=%r href=%r", i, a.get_text(" ", strip=True), a.get('href'))
+        except Exception:
+            logging.debug("anchor[%d]: (could not read text/href)", i)
+
+    # 전체 anchors에서 다시 날짜 매칭 시도
     now = datetime.now(ZoneInfo("Asia/Seoul"))
-    md = f"{now.month}월 {now.day}일"
+    date_re = re.compile(fr"{now.month}\s*월\s*{now.day}\s*일")
     for a in anchors:
         txt = a.get_text(" ", strip=True)
-        if md in txt:
-            href = a.get("href")
+        if date_re.search(txt):
+            href = a.get('href')
             return urljoin(BASE, href)
 
-    # 없으면 가장 최근(첫 항목)
-    href = anchors[0].get("href")
+    # 날짜 매칭도 실패하면 document_srl 값이 큰(최신) 링크를 선택
+    def extract_srl(href):
+        if not href:
+            return None
+        m = re.search(r"document_srl=(\d+)", href)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                return None
+        return None
+
+    best = None
+    best_srl = -1
+    for a in anchors:
+        try:
+            href = a.get('href')
+            srl = extract_srl(href)
+            if srl is not None and srl > best_srl:
+                best_srl = srl
+                best = href
+        except Exception:
+            continue
+
+    if best:
+        logging.debug("no exact date match; choosing highest document_srl=%s -> %s", best_srl, best)
+        return urljoin(BASE, best)
+
+    # fallback: 첫 항목
+    href = anchors[0].get('href')
     return urljoin(BASE, href)
 
 
