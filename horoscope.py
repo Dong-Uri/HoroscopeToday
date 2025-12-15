@@ -498,8 +498,9 @@ def main(argv=None):
 
     image_urls = extract_mk_images(html, post_url)
 
-    # 텍스트가 없는 기사(이미지 2장) 대비: 제목/링크 + 이미지 전송
-    message = f"🔮 {page_title}\n{post_url}"
+    # 이미지 카드 전송 시에는 카드 헤더에 제목/링크를 넣으므로,
+    # 본문 메시지에는 중복으로 넣지 않는다.
+    message = "" if image_urls else f"🔮 {page_title}\n{post_url}"
 
     # 길이 제한 처리
     if len(message) > MAX_MESSAGE_LEN:
@@ -509,7 +510,10 @@ def main(argv=None):
     if args.dry_run:
         # dry-run: 웹훅 전송을 하지 않고 출력
         logging.info("Dry-run: 웹훅 전송을 건너뜁니다. 출력으로 대신합니다.")
-        print(message)
+        if image_urls:
+            print(f"🔮 {page_title}\n{post_url}")
+        else:
+            print(message)
         if image_urls:
             print("\n[images]")
             for u in image_urls:
