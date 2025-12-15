@@ -1,7 +1,10 @@
-# -*- coding: utf-8 -*-
 """
-askjiyun.com/today의 '오늘의 운세, M월 D일' 게시글 전체 본문을
+매일경제(MK)에서 '오늘의 운세' 게시글을 찾아
 Google Chat Incoming Webhook으로 전송하는 스크립트 (개인용).
+
+특이사항:
+- 주말 운세는 토/일 2일치가 한 게시글로 올라올 수 있음 (제목에 날짜가 2개).
+- 게시글 본문은 텍스트가 아니라 이미지 2장으로 구성되는 경우가 있음.
 
 설치: pip install requests beautifulsoup4
 환경변수: GCHAT_WEBHOOK  (Google Chat에서 발급받은 웹훅 URL)
@@ -12,16 +15,20 @@ import time
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
+from typing import Optional, List
 
 import requests
 from bs4 import BeautifulSoup
 import urllib.robotparser as robotparser
 
 # ---------- 설정 ----------
-BASE = "https://askjiyun.com"
-LIST_URL = urljoin(BASE, "?mid=today")
-TITLE_RE = re.compile(r"^오늘의 운세,\s*\d+월\s*\d+일")
+MK_BASE = "https://www.mk.co.kr"
+SEARCH_URL = "https://www.mk.co.kr/search?word=%EC%98%A4%EB%8A%98%EC%9D%98%20%EC%9A%B4%EC%84%B8"
+# 제목 예시:
+# - 오늘의 운세 2025년 12월 15일 月(음력 10월 26일)
+# - 오늘의 운세 2025년 12월 13일 土(음력 10월 24일)·2025년 12월 14일 日(음력 10월 25일)
+TITLE_PREFIX = "오늘의 운세"
 GCHAT_WEBHOOK = os.getenv("GCHAT_WEBHOOK")
 
 # 전송 최대 길이: 너무 길면 웹훅/채널에서 문제될 수 있으므로 안전하게 자름
@@ -34,17 +41,17 @@ UA = {
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/127.0.0.0 Safari/537.36"),
     "Accept-Language": "ko,en;q=0.8",
-    "Referer": BASE,
+    "Referer": MK_BASE,
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 # ---------- 유틸: robots 체크 ----------
-def allowed_by_robots(url, user_agent="*"):
+def allowed_by_robots(url, base_url, user_agent="*"):
     try:
         rp = robotparser.RobotFileParser()
-        robots_url = urljoin(BASE, "/robots.txt")
+        robots_url = urljoin(base_url, "/robots.txt")
         rp.set_url(robots_url)
         rp.read()
         return rp.can_fetch(user_agent, url)
@@ -70,113 +77,101 @@ def http_get(url, timeout=15, retry=3, backoff=1.2):
 
 
 # ---------- 목록에서 오늘 게시글 링크 찾기 ----------
-def find_today_post_url():
-    """목록(여러 페이지)을 순회하며 '오늘의 운세' 게시글 URL을 찾습니다.
+def _mk_search_page_url(page: int) -> str:
+    if page <= 1:
+        return SEARCH_URL
+    sep = "&" if "?" in SEARCH_URL else "?"
+    return f"{SEARCH_URL}{sep}page={page}"
 
-    동작 순서:
-    - page=1..MAX_LIST_PAGES 를 순회하며 anchors를 수집
-    - 각 페이지에서 오늘 날짜(Asia/Seoul 기준)가 포함된 링크가 있으면 즉시 반환
-    - 전체 수집 후에도 없다면 document_srl 값이 가장 큰(=최신) 링크를 선택
+
+def _clean_title_text(text: str) -> str:
+    return (text or "").replace("\u00a0", " ").strip()
+
+
+def find_today_post_url():
+    """검색 결과(여러 페이지)를 순회하며 오늘 날짜가 포함된 '오늘의 운세' 게시글 URL을 찾습니다.
+
+    주말 운세처럼 날짜가 2개인 제목도 '오늘 날짜' 문자열이 포함되면 매칭됩니다.
     """
-    anchors = []
-    soup = None
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    today_token = f"{now.year}년 {now.month}월 {now.day}일"
+    want = re.compile(rf"{re.escape(TITLE_PREFIX)}\s+.*{re.escape(today_token)}")
+
+    fallback_links: list[str] = []
     for page in range(1, MAX_LIST_PAGES + 1):
-        if page == 1:
-            url = LIST_URL
-        else:
-            sep = '&' if '?' in LIST_URL else '?'
-            url = f"{LIST_URL}{sep}page={page}"
-        logging.debug("fetching list page %d: %s", page, url)
+        url = _mk_search_page_url(page)
+        logging.debug("fetching search page %d: %s", page, url)
         try:
             html = http_get(url)
         except Exception as e:
-            logging.warning("목록 페이지 가져오기 실패 (page %d): %s", page, e)
+            logging.warning("검색 페이지 가져오기 실패 (page %d): %s", page, e)
             continue
+
         soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.find_all("a")
+        for a in anchors:
+            title = _clean_title_text(a.get_text(" ", strip=True))
+            if TITLE_PREFIX not in title:
+                continue
+            href = a.get("href")
+            if not href:
+                continue
+            post_url = urljoin(MK_BASE, href)
+            fallback_links.append(post_url)
+            if want.search(title):
+                return post_url
 
-        # 1) 제목 텍스트가 정확히 매칭되는 a 태그 찾기
-        page_anchors = soup.find_all("a", string=re.compile(r"^오늘의 운세,\s*\d{1,2}\s*월\s*\d{1,2}\s*일"))
-        if not page_anchors:
-            # 2) 텍스트 조합(공백/nbsp 등) 보정해서 찾기
-            page_anchors = []
-            for a in soup.find_all("a"):
-                txt = (a.get_text(" ", strip=True) or "").replace("\u00a0", " ")
-                if re.match(r"^오늘의 운세,\s*\d{1,2}\s*월\s*\d{1,2}\s*일", txt):
-                    page_anchors.append(a)
+    if fallback_links:
+        return fallback_links[0]
+    raise RuntimeError("검색 결과에서 '오늘의 운세' 게시글 링크를 찾지 못했습니다.")
 
-        if not page_anchors:
-            # 3) 대체: 모든 링크에서 접두사로 시작하는 텍스트 검사
-            for a in soup.select("a"):
-                txt = (a.get_text(" ", strip=True) or "")
-                if txt.startswith("오늘의 운세,"):
-                    page_anchors.append(a)
 
-        if page_anchors:
-            logging.debug("found %d anchors on page %d", len(page_anchors), page)
-            anchors.extend(page_anchors)
+def extract_mk_images(html: str, base_url: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = []
 
-        # 페이지에서 오늘 날짜 우선 탐색 (KST 기준)
-        now = datetime.now(ZoneInfo("Asia/Seoul"))
-        date_re = re.compile(fr"{now.month}\s*월\s*{now.day}\s*일")
-        for a in page_anchors:
-            txt = a.get_text(" ", strip=True)
-            if date_re.search(txt):
-                href = a.get("href")
-                logging.debug("matched today on page %d: %s", page, href)
-                return urljoin(BASE, href)
+    container_selectors = [
+        "article",
+        ".news_detail",
+        ".article_body",
+        ".news_cnt_detail_wrap",
+        ".view_contents",
+        "#container",
+        "body",
+    ]
+    container = None
+    for s in container_selectors:
+        el = soup.select_one(s)
+        if el:
+            container = el
+            break
+    if not container:
+        container = soup
 
-    # 모든 페이지를 돌았지만 오늘 링크를 못 찾음
-    if not anchors:
-        raise RuntimeError("목록에서 '오늘의 운세' 링크를 찾지 못했습니다.")
-
-    # 디버그: 발견된 anchors 목록 로깅 (텍스트와 href)
-    logging.debug("found total %d anchors across pages for '오늘의 운세'", len(anchors))
-    for i, a in enumerate(anchors[:60]):
-        try:
-            logging.debug("anchor[%d]: text=%r href=%r", i, a.get_text(" ", strip=True), a.get('href'))
-        except Exception:
-            logging.debug("anchor[%d]: (could not read text/href)", i)
-
-    # 전체 anchors에서 다시 날짜 매칭 시도
-    now = datetime.now(ZoneInfo("Asia/Seoul"))
-    date_re = re.compile(fr"{now.month}\s*월\s*{now.day}\s*일")
-    for a in anchors:
-        txt = a.get_text(" ", strip=True)
-        if date_re.search(txt):
-            href = a.get('href')
-            return urljoin(BASE, href)
-
-    # 날짜 매칭도 실패하면 document_srl 값이 큰(최신) 링크를 선택
-    def extract_srl(href):
-        if not href:
-            return None
-        m = re.search(r"document_srl=(\d+)", href)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                return None
-        return None
-
-    best = None
-    best_srl = -1
-    for a in anchors:
-        try:
-            href = a.get('href')
-            srl = extract_srl(href)
-            if srl is not None and srl > best_srl:
-                best_srl = srl
-                best = href
-        except Exception:
+    for img in container.find_all("img"):
+        src = img.get("src") or img.get("data-src") or img.get("data-original")
+        if not src:
             continue
+        if src.startswith("data:"):
+            continue
+        abs_url = urljoin(base_url, src)
+        if not re.search(r"\.(png|jpe?g|webp)(\?|$)", abs_url, re.I):
+            continue
+        if any(token in abs_url.lower() for token in ["logo", "icon", "sprite", "blank"]):
+            continue
+        candidates.append(abs_url)
 
-    if best:
-        logging.debug("no exact date match; choosing highest document_srl=%s -> %s", best_srl, best)
-        return urljoin(BASE, best)
+    # 순서 유지 + 중복 제거
+    seen = set()
+    uniq = []
+    for u in candidates:
+        if u in seen:
+            continue
+        seen.add(u)
+        uniq.append(u)
 
-    # fallback: 첫 항목
-    href = anchors[0].get('href')
-    return urljoin(BASE, href)
+    # 운세는 보통 2장 이미지로 구성됨
+    return uniq[:4]
 
 
 # ---------- 게시글 본문 파싱 (본문 컨테이너 후보를 넓게 잡음) ----------
@@ -324,12 +319,35 @@ def parse_post(html, debug=False):
 
 
 # ---------- Google Chat 전송 ----------
-def send_to_gchat(message, use_card=False):
+def send_to_gchat(
+    message: str,
+    *,
+    title: Optional[str] = None,
+    link_url: Optional[str] = None,
+    image_urls: Optional[List[str]] = None,
+):
     if not GCHAT_WEBHOOK:
         raise RuntimeError("환경변수 GCHAT_WEBHOOK이 설정되어 있지 않습니다.")
-    if use_card:
-        # Google Chat card payload keeps text formatting in a textParagraph
-        payload = {"cards": [{"sections": [{"widgets": [{"textParagraph": {"text": message}}]}]}]}
+    image_urls = image_urls or []
+
+    # 기본은 text 메시지로 보내되, 이미지가 있으면 카드로 보냄.
+    if image_urls:
+        widgets = []
+        if title or link_url:
+            header_lines = []
+            if title:
+                header_lines.append(f"<b>{title}</b>")
+            if link_url:
+                header_lines.append(f"<a href=\"{link_url}\">{link_url}</a>")
+            widgets.append({"textParagraph": {"text": "<br/>".join(header_lines)}})
+        if message:
+            widgets.append({"textParagraph": {"text": message.replace("\n", "<br/>")}})
+        for u in image_urls:
+            w = {"image": {"imageUrl": u}}
+            if link_url:
+                w["image"]["onClick"] = {"openLink": {"url": link_url}}
+            widgets.append(w)
+        payload = {"cards": [{"sections": [{"widgets": widgets}]}]}
     else:
         payload = {"text": message}
     # 디버그용: 페이로드를 로깅 (실제 전송 전 확인 가능)
@@ -447,7 +465,7 @@ def _normalize_spacing(text: str) -> str:
 def main(argv=None):
     import argparse
 
-    parser = argparse.ArgumentParser(description="askjiyun 오늘의 운세 전송기 (개인용)")
+    parser = argparse.ArgumentParser(description="매일경제 오늘의 운세 전송기 (개인용)")
     parser.add_argument("--dry-run", action="store_true", help="웹훅으로 전송하지 않고 결과를 콘솔에 출력합니다.")
     parser.add_argument("--debug", action="store_true", help="디버그 로깅을 활성화")
     # keep only the essential flags
@@ -456,10 +474,10 @@ def main(argv=None):
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    logging.info("시작: askjiyun 오늘의 운세 전송 (전체본문)")
+    logging.info("시작: 매일경제 오늘의 운세 전송")
 
     # robots 체크 (선택) — 개인용이라면 실패 시에도 계속 진행하도록 True 반환
-    if not allowed_by_robots(LIST_URL):
+    if not allowed_by_robots(SEARCH_URL, MK_BASE):
         logging.warning("robots.txt에서 크롤링을 금지했을 가능성이 있습니다. 계속 진행하려면 코드를 수정하세요.")
         # 계속 진행하려면 주석처리하거나 허용으로 변경하세요.
         # return
@@ -469,95 +487,35 @@ def main(argv=None):
 
     # 게시글 요청/파싱
     html = http_get(post_url)
-    # 기본 동작: 정제된 본문(parse_post)을 사용
-    text = parse_post(html, debug=args.debug)
-    if args.debug:
-        logging.debug("default(clean) mode: cleaned text length=%d", len(text))
+    soup = BeautifulSoup(html, "html.parser")
 
-    # 최소 변환 요구사항만 적용:
-    # 1) '[' 이전 문자 제거 (본문 시작에서 대괄호 전까지 제거)
-    # 2) '<' '>' 및 '〈' '〉' 전후로 줄바꿈 2회
-    # 3) '년생' 뒤에 줄바꿈
-    # 4) '.' 뒤에 줄바꿈
-    # (그 외 기존의 추가 정제 동작은 하지 않음)
+    page_title = None
+    og = soup.select_one('meta[property="og:title"]')
+    if og and og.get("content"):
+        page_title = og.get("content").strip()
+    if not page_title:
+        page_title = (soup.find("title").get_text(strip=True) if soup.find("title") else TITLE_PREFIX)
 
-    # 1) '[' 이전 문자 제거: 첫 '['가 등장하기 전의 모든 텍스트를 제거
-    try:
-        idx = text.find('[')
-        if idx != -1:
-            text = text[idx:]
-    except Exception:
-        pass
+    image_urls = extract_mk_images(html, post_url)
 
-    # 제목(페이지 <title>에서 가져오기)
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        title_raw = (soup.find("title").get_text(strip=True) if soup.find("title") else "")
-        # 사이트 도메인 등 불필요한 접미사/접두사 제거
-        netloc = urlparse(BASE).netloc
-        page_title = title_raw
-        if netloc:
-            # remove occurrences of the domain surrounded by common separators
-            page_title = re.sub(rf"\s*[-–—|·:]?\s*{re.escape(netloc)}\s*$", "", page_title)
-            page_title = re.sub(rf"^{re.escape(netloc)}\s*[-–—|·:]?\s*", "", page_title)
-            page_title = page_title.replace(netloc, "")
-        # strip leftover separators/extra whitespace
-        page_title = re.sub(r"^[\s\-–—|·:]+|[\s\-–—|·:]+$", "", page_title).strip()
-    except Exception:
-        page_title = "오늘의 운세"
-
-    header = f"🔮 *{page_title}*\n\n"
-    message = header + text
+    # 텍스트가 없는 기사(이미지 2장) 대비: 제목/링크 + 이미지 전송
+    message = f"🔮 {page_title}\n{post_url}"
 
     # 길이 제한 처리
     if len(message) > MAX_MESSAGE_LEN:
         logging.warning("메시지가 너무 깁니다 (%d자). 자릅니다.", len(message))
         message = message[:MAX_MESSAGE_LEN] + "\n\n(메시지가 길어 일부만 전송됩니다. 원문에서 전체 확인하세요.)"
 
-    # 이제 요청된 최소 후처리만 수행
-    # 2) 브래킷 전후로 빈 줄(두 줄) 삽입: ASCII < > 와 fullwidth 〈 〉 처리
-    message = re.sub(r"\s*(<|〈)", r"\n\n\1", message)
-    message = re.sub(r"(>|〉)\s*", r"\1\n\n", message)
-    # 연속 개행은 최대 2개로 제한
-    message = re.sub(r"\n{3,}", "\n\n", message)
-
-    # 3) '년생' 뒤 줄바꿈
-    message = re.sub(r"(년생)\s*", r"\1\n", message)
-
-    # 4) 마침표 뒤 줄바꿈
-    message = re.sub(r"\.\s*", ".\n", message)
-
-    # 마지막: 보수적으로 본문 끝의 잔여 보일러플레이트(예: '이 게시물을.') 제거
-    # 끝에서부터 3줄 정도를 검사하여 '이 게시물' 같은 패턴이 포함된 라인을 제거
-    try:
-        # 라인 단위로 뒤쪽에서부터 검사하여 다음을 제거:
-        # - 온전히 '.' 또는 공백으로만 된 라인들
-        # - 마지막 라인에 붙어 있는 '이 게시물을.' 등 보일러플레이트 문구
-        lines = message.rstrip().splitlines()
-        # 1) remove trailing lines that are only dots/spaces
-        while lines and re.fullmatch(r"[.\s]+", lines[-1]):
-            lines.pop()
-
-        # 2) if the last line ends with boilerplate phrase, strip that phrase
-        if lines:
-            last = lines[-1]
-            new_last = re.sub(r"(?:\s|^)(?:이 게시물을?|이 게시물|이 글|출처|공유|댓글)[\s\.:,]*$", "", last, flags=re.I).rstrip()
-            lines[-1] = new_last
-
-        # 3) if after stripping the last line becomes empty or is solely a boilerplate, pop it
-        while lines and re.fullmatch(r"\s*", lines[-1]):
-            lines.pop()
-
-        message = "\n".join(lines).rstrip()
-    except Exception:
-        pass
-
     if args.dry_run:
         # dry-run: 웹훅 전송을 하지 않고 출력
         logging.info("Dry-run: 웹훅 전송을 건너뜁니다. 출력으로 대신합니다.")
         print(message)
+        if image_urls:
+            print("\n[images]")
+            for u in image_urls:
+                print(u)
     else:
-        send_to_gchat(message)
+        send_to_gchat(message, title=page_title, link_url=post_url, image_urls=image_urls)
         logging.info("완료.")
 
 
