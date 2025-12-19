@@ -626,7 +626,7 @@ def main(argv=None):
     # both 모드: MK(이미지) + 지윤(텍스트)을 한 번에 보기 좋게 하나의 카드/메시지로 합친다.
     if which == "both" and mk_job and jiyun_job:
         combined_title = "오늘의 운세"
-        combined_url = mk_job["url"]
+        combined_url = None
         jiyun_body = jiyun_job["message"]
         if "\n\n" in jiyun_body:
             jiyun_body = jiyun_body.split("\n\n", 1)[1]
@@ -685,7 +685,7 @@ def main(argv=None):
                 print()
     else:
         for j in jobs:
-            send_to_gchat(j["message"], title=j["title"], link_url=j["url"], image_urls=j["image_urls"])
+            send_to_gchat(j["message"], title=j["title"], link_url=j.get("url"), image_urls=j["image_urls"])
         logging.info("완료.")
 
 
