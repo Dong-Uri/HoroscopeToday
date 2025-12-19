@@ -504,6 +504,19 @@ def _normalize_spacing(text: str) -> str:
     out = re.sub(r"\n{3,}", "\n\n", out)
     return out.strip()
 
+def _format_jiyun_readable(text: str) -> str:
+    """askjiyun 본문을 모바일에서 읽기 좋게 단락을 나눕니다."""
+    if not text:
+        return text
+    t = text.strip()
+    # 띠 구분(〈쥐띠〉 등) 앞에 단락을 넣어 가독성 개선
+    t = re.sub(r"\s*(〈[^〉]+〉)", r"\n\n\1", t)
+    # 운세지수(…%)를 각 띠의 끝으로 보이게
+    t = re.sub(r"\s*(운세지수\s*\d+%\.?)\s*", r" \1\n", t)
+    # 과도한 빈 줄 정리
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
 
 # ---------- main ----------
 def main(argv=None):
@@ -535,6 +548,8 @@ def main(argv=None):
         logging.warning("robots.txt에서 크롤링을 금지했을 가능성이 있습니다. 계속 진행하려면 코드를 수정하세요.")
 
     jobs = []
+    mk_job = None
+    jiyun_job = None
 
     if which in ("both", "mk"):
         post_url = find_today_post_url()
@@ -551,15 +566,19 @@ def main(argv=None):
             page_title = (soup.find("title").get_text(strip=True) if soup.find("title") else TITLE_PREFIX)
 
         image_urls = extract_mk_images(html, post_url)
-        message = "" if image_urls else f"🔮 {page_title}\n{post_url}"
-        jobs.append(
-            {
-                "title": page_title,
-                "url": post_url,
-                "message": message,
-                "image_urls": image_urls,
-            }
-        )
+        # 본문이 이미지로만 구성되기도 함(MK는 자주 이미지 2장). 이 경우 텍스트 파싱은 잡음이 많아 제외.
+        if image_urls:
+            message = ""
+        else:
+            mk_text = parse_post(html)
+            mk_text = _normalize_spacing(_strip_trailing_boilerplate(mk_text))
+            message = f"🔮 {page_title}\n{post_url}\n\n{mk_text}".strip()
+        mk_job = {
+            "title": page_title,
+            "url": post_url,
+            "message": message,
+            "image_urls": image_urls,
+        }
 
     if which in ("both", "jiyun"):
         post_url = find_askjiyun_today_post_url()
@@ -571,15 +590,50 @@ def main(argv=None):
         # 본문 파싱/정리
         text = parse_post(html)
         text = _normalize_spacing(_strip_trailing_boilerplate(text))
+        text = _format_jiyun_readable(text)
         message = f"🔮 {page_title}\n{post_url}\n\n{text}".strip()
+        jiyun_job = {
+            "title": page_title,
+            "url": post_url,
+            "message": message,
+            "image_urls": [],
+        }
+
+    # both 모드: MK(이미지) + 지윤(텍스트)을 한 번에 보기 좋게 하나의 카드/메시지로 합친다.
+    if which == "both" and mk_job and jiyun_job:
+        combined_title = "오늘의 운세"
+        combined_url = mk_job["url"]
+        jiyun_body = jiyun_job["message"]
+        if "\n\n" in jiyun_body:
+            jiyun_body = jiyun_body.split("\n\n", 1)[1]
+        # 지윤 본문 첫 줄(게시글 헤더)을 카드 제목으로 쓰고, 본문에서는 제거
+        j_lines = jiyun_body.splitlines()
+        header_idx = None
+        for i, ln in enumerate(j_lines):
+            if ln.strip():
+                header_idx = i
+                header = ln.strip()
+                combined_title = header if header.startswith("🔮") else f"🔮 {header}"
+                break
+        body_lines = j_lines[header_idx + 1 :] if header_idx is not None else j_lines
+        # 시작 부분의 공백 줄 제거
+        while body_lines and not body_lines[0].strip():
+            body_lines.pop(0)
+        combined_message = "\n".join(body_lines).strip()
         jobs.append(
             {
-                "title": page_title,
-                "url": post_url,
-                "message": message,
-                "image_urls": [],
+                "title": combined_title,
+                "url": combined_url,
+                "message": combined_message,
+                "image_urls": mk_job["image_urls"],
+                "is_combined": True,
             }
         )
+    else:
+        if mk_job:
+            jobs.append(mk_job)
+        if jiyun_job:
+            jobs.append(jiyun_job)
 
     # 길이 제한 처리(각 메시지별)
     for j in jobs:
@@ -591,7 +645,13 @@ def main(argv=None):
         logging.info("Dry-run: 웹훅 전송을 건너뜁니다. 출력으로 대신합니다.")
         for j in jobs:
             if j["image_urls"]:
-                print(f"🔮 {j['title']}\n{j['url']}")
+                if j.get("is_combined"):
+                    print(f"{j['title']}")
+                else:
+                    print(f"🔮 {j['title']}\n{j['url']}")
+                if j["message"]:
+                    print()
+                    print(j["message"])
                 print("\n[images]")
                 for u in j["image_urls"]:
                     print(u)
