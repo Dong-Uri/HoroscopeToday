@@ -38,6 +38,14 @@ GCHAT_WEBHOOK = os.getenv("GCHAT_WEBHOOK")
 MAX_MESSAGE_LEN = 14000
 MAX_LIST_PAGES = 6  # 최대 몇 페이지까지 목록을 탐색할지 (1-based)
 
+# GitHub Actions 등에서 간헐적으로 연결 지연이 있어 사이트별 timeout/retry를 분리
+MK_TIMEOUT = float(os.getenv("MK_TIMEOUT", "15"))
+MK_RETRY = int(os.getenv("MK_RETRY", "3"))
+# requests timeout은 (connect, read) 튜플도 가능
+ASKJIYUN_CONNECT_TIMEOUT = float(os.getenv("ASKJIYUN_CONNECT_TIMEOUT", "30"))
+ASKJIYUN_READ_TIMEOUT = float(os.getenv("ASKJIYUN_READ_TIMEOUT", "30"))
+ASKJIYUN_RETRY = int(os.getenv("ASKJIYUN_RETRY", "5"))
+
 # HTTP 헤더 (간단한 브라우저처럼)
 MK_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -77,7 +85,7 @@ def allowed_by_robots(url, base_url, user_agent="*"):
 
 
 # ---------- HTTP 요청 with retry ----------
-def http_get(url, *, headers=None, timeout=15, retry=3, backoff=1.2):
+def http_get(url, *, headers=None, timeout=15, retry=3, backoff=1.2, backoff_factor=1.6):
     last_exc = None
     for i in range(1, retry + 1):
         try:
@@ -88,6 +96,7 @@ def http_get(url, *, headers=None, timeout=15, retry=3, backoff=1.2):
             last_exc = e
             logging.warning("GET 실패 (%s) %s (시도 %d/%d)", url, e, i, retry)
             time.sleep(backoff)
+            backoff *= backoff_factor
     raise RuntimeError(f"GET 실패: {url} / {last_exc}")
 
 
@@ -117,7 +126,7 @@ def find_today_post_url():
         url = _mk_search_page_url(page)
         logging.debug("fetching search page %d: %s", page, url)
         try:
-            html = http_get(url, headers=MK_HEADERS)
+            html = http_get(url, headers=MK_HEADERS, timeout=MK_TIMEOUT, retry=MK_RETRY)
         except Exception as e:
             logging.warning("검색 페이지 가져오기 실패 (page %d): %s", page, e)
             continue
@@ -147,7 +156,12 @@ def find_askjiyun_today_post_url():
     today_token = f"{now.month}월 {now.day}일"
     want = re.compile(rf"^{re.escape(TITLE_PREFIX)}\s*,\s*{re.escape(today_token)}\s*$")
 
-    html = http_get(ASKJIYUN_TODAY_LIST_URL, headers=ASKJIYUN_HEADERS)
+    html = http_get(
+        ASKJIYUN_TODAY_LIST_URL,
+        headers=ASKJIYUN_HEADERS,
+        timeout=(ASKJIYUN_CONNECT_TIMEOUT, ASKJIYUN_READ_TIMEOUT),
+        retry=ASKJIYUN_RETRY,
+    )
     soup = BeautifulSoup(html, "html.parser")
 
     candidates: list[tuple[str, str]] = []
@@ -555,7 +569,7 @@ def main(argv=None):
         post_url = find_today_post_url()
         logging.info("MK 게시글 URL: %s", post_url)
 
-        html = http_get(post_url, headers=MK_HEADERS)
+        html = http_get(post_url, headers=MK_HEADERS, timeout=MK_TIMEOUT, retry=MK_RETRY)
         soup = BeautifulSoup(html, "html.parser")
 
         page_title = None
@@ -581,23 +595,33 @@ def main(argv=None):
         }
 
     if which in ("both", "jiyun"):
-        post_url = find_askjiyun_today_post_url()
-        logging.info("askjiyun 게시글 URL: %s", post_url)
+        try:
+            post_url = find_askjiyun_today_post_url()
+            logging.info("askjiyun 게시글 URL: %s", post_url)
 
-        html = http_get(post_url, headers=ASKJIYUN_HEADERS)
-        soup = BeautifulSoup(html, "html.parser")
-        page_title = (soup.find("title").get_text(strip=True) if soup.find("title") else "askjiyun 오늘의 운세")
-        # 본문 파싱/정리
-        text = parse_post(html)
-        text = _normalize_spacing(_strip_trailing_boilerplate(text))
-        text = _format_jiyun_readable(text)
-        message = f"🔮 {page_title}\n{post_url}\n\n{text}".strip()
-        jiyun_job = {
-            "title": page_title,
-            "url": post_url,
-            "message": message,
-            "image_urls": [],
-        }
+            html = http_get(
+                post_url,
+                headers=ASKJIYUN_HEADERS,
+                timeout=(ASKJIYUN_CONNECT_TIMEOUT, ASKJIYUN_READ_TIMEOUT),
+                retry=ASKJIYUN_RETRY,
+            )
+            soup = BeautifulSoup(html, "html.parser")
+            page_title = (soup.find("title").get_text(strip=True) if soup.find("title") else "askjiyun 오늘의 운세")
+            # 본문 파싱/정리
+            text = parse_post(html)
+            text = _normalize_spacing(_strip_trailing_boilerplate(text))
+            text = _format_jiyun_readable(text)
+            message = f"🔮 {page_title}\n{post_url}\n\n{text}".strip()
+            jiyun_job = {
+                "title": page_title,
+                "url": post_url,
+                "message": message,
+                "image_urls": [],
+            }
+        except Exception as e:
+            # Actions 등에서 간헐적으로 타임아웃이 나면 MK만이라도 보내도록 한다.
+            logging.warning("askjiyun 가져오기 실패(건너뜀): %s", e)
+            jiyun_job = None
 
     # both 모드: MK(이미지) + 지윤(텍스트)을 한 번에 보기 좋게 하나의 카드/메시지로 합친다.
     if which == "both" and mk_job and jiyun_job:
