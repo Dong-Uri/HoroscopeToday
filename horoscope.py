@@ -13,7 +13,7 @@ import os
 import re
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 from typing import Optional, List
@@ -37,6 +37,13 @@ GCHAT_WEBHOOK = os.getenv("GCHAT_WEBHOOK")
 # 전송 최대 길이: 너무 길면 웹훅/채널에서 문제될 수 있으므로 안전하게 자름
 MAX_MESSAGE_LEN = 14000
 MAX_LIST_PAGES = 6  # 최대 몇 페이지까지 목록을 탐색할지 (1-based)
+
+# MK는 신문 특성상 주말(토/일) 운세가 합본으로 올라오는 경우가 있습니다.
+# 이 스크립트는 "토요일에도, 일요일에도" 같은 MK 주말 이미지를 함께 보내는 것을 기본으로 합니다.
+# (토요일: 지윤 토요일 + MK 주말 이미지 / 일요일: 지윤 일요일 + MK 주말 이미지)
+#
+# 만약 같은 MK 글을 이틀 연속 보내기 싫으면 환경변수로 중복 전송을 끌 수 있습니다.
+SKIP_MK_WEEKEND_DUPLICATE = os.getenv("SKIP_MK_WEEKEND_DUPLICATE", "").strip().lower() in ("1", "true", "yes", "y")
 
 # GitHub Actions 등에서 간헐적으로 연결 지연이 있어 사이트별 timeout/retry를 분리
 MK_TIMEOUT = float(os.getenv("MK_TIMEOUT", "15"))
@@ -110,6 +117,27 @@ def _mk_search_page_url(page: int) -> str:
 
 def _clean_title_text(text: str) -> str:
     return (text or "").replace("\u00a0", " ").strip()
+
+
+def _extract_dates_from_title(title: str) -> list[date]:
+    """제목에서 'YYYY년 M월 D일' 패턴을 모두 추출합니다."""
+    if not title:
+        return []
+    out: list[date] = []
+    for y, m, d in re.findall(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일", title):
+        try:
+            out.append(date(int(y), int(m), int(d)))
+        except ValueError:
+            continue
+    # 순서 유지 + 중복 제거
+    seen = set()
+    uniq = []
+    for dt in out:
+        if dt in seen:
+            continue
+        seen.add(dt)
+        uniq.append(dt)
+    return uniq
 
 
 def find_today_post_url():
@@ -579,20 +607,31 @@ def main(argv=None):
         if not page_title:
             page_title = (soup.find("title").get_text(strip=True) if soup.find("title") else TITLE_PREFIX)
 
-        image_urls = extract_mk_images(html, post_url)
-        # 본문이 이미지로만 구성되기도 함(MK는 자주 이미지 2장). 이 경우 텍스트 파싱은 잡음이 많아 제외.
-        if image_urls:
-            message = ""
+        # 주말 합본 글(제목에 날짜 2개) 처리
+        now = datetime.now(ZoneInfo("Asia/Seoul")).date()
+        title_dates = _extract_dates_from_title(page_title)
+        if SKIP_MK_WEEKEND_DUPLICATE and len(title_dates) >= 2 and now in title_dates and now != title_dates[0]:
+            logging.info(
+                "MK 주말 합본 글로 판단되어 중복 전송 방지로 건너뜀: title_dates=%s, today=%s",
+                title_dates,
+                now,
+            )
+            mk_job = None
         else:
-            mk_text = parse_post(html)
-            mk_text = _normalize_spacing(_strip_trailing_boilerplate(mk_text))
-            message = f"🔮 {page_title}\n{post_url}\n\n{mk_text}".strip()
-        mk_job = {
-            "title": page_title,
-            "url": post_url,
-            "message": message,
-            "image_urls": image_urls,
-        }
+            image_urls = extract_mk_images(html, post_url)
+            # 본문이 이미지로만 구성되기도 함(MK는 자주 이미지 2장). 이 경우 텍스트 파싱은 잡음이 많아 제외.
+            if image_urls:
+                message = ""
+            else:
+                mk_text = parse_post(html)
+                mk_text = _normalize_spacing(_strip_trailing_boilerplate(mk_text))
+                message = f"🔮 {page_title}\n{post_url}\n\n{mk_text}".strip()
+            mk_job = {
+                "title": page_title,
+                "url": post_url,
+                "message": message,
+                "image_urls": image_urls,
+            }
 
     if which in ("both", "jiyun"):
         try:
