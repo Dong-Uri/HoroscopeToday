@@ -25,6 +25,9 @@ import urllib.robotparser as robotparser
 # ---------- 설정 ----------
 MK_BASE = "https://www.mk.co.kr"
 SEARCH_URL = "https://www.mk.co.kr/search?word=%EC%98%A4%EB%8A%98%EC%9D%98%20%EC%9A%B4%EC%84%B8"
+# askjiyun (지윤철학원) 오늘의 운세 목록
+BASE = "https://askjiyun.com"
+ASKJIYUN_TODAY_LIST_URL = urljoin(BASE, "/today")
 # 제목 예시:
 # - 오늘의 운세 2025년 12월 15일 月(음력 10월 26일)
 # - 오늘의 운세 2025년 12월 13일 土(음력 10월 24일)·2025년 12월 14일 日(음력 10월 25일)
@@ -36,12 +39,24 @@ MAX_MESSAGE_LEN = 14000
 MAX_LIST_PAGES = 6  # 최대 몇 페이지까지 목록을 탐색할지 (1-based)
 
 # HTTP 헤더 (간단한 브라우저처럼)
-UA = {
+MK_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                    "Chrome/127.0.0.0 Safari/537.36"),
     "Accept-Language": "ko,en;q=0.8",
     "Referer": MK_BASE,
+}
+
+ASKJIYUN_HEADERS = {
+    # ModSecurity(406) 회피를 위해 브라우저 헤더를 조금 더 흉내낸다.
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/127.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko,en;q=0.8",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": BASE,
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -62,11 +77,11 @@ def allowed_by_robots(url, base_url, user_agent="*"):
 
 
 # ---------- HTTP 요청 with retry ----------
-def http_get(url, timeout=15, retry=3, backoff=1.2):
+def http_get(url, *, headers=None, timeout=15, retry=3, backoff=1.2):
     last_exc = None
     for i in range(1, retry + 1):
         try:
-            resp = requests.get(url, headers=UA, timeout=timeout)
+            resp = requests.get(url, headers=headers or MK_HEADERS, timeout=timeout)
             resp.raise_for_status()
             return resp.text
         except Exception as e:
@@ -102,7 +117,7 @@ def find_today_post_url():
         url = _mk_search_page_url(page)
         logging.debug("fetching search page %d: %s", page, url)
         try:
-            html = http_get(url)
+            html = http_get(url, headers=MK_HEADERS)
         except Exception as e:
             logging.warning("검색 페이지 가져오기 실패 (page %d): %s", page, e)
             continue
@@ -124,6 +139,34 @@ def find_today_post_url():
     if fallback_links:
         return fallback_links[0]
     raise RuntimeError("검색 결과에서 '오늘의 운세' 게시글 링크를 찾지 못했습니다.")
+
+
+def find_askjiyun_today_post_url():
+    """askjiyun.com /today 목록에서 오늘 날짜의 '오늘의 운세' 게시글 URL을 찾습니다."""
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    today_token = f"{now.month}월 {now.day}일"
+    want = re.compile(rf"^{re.escape(TITLE_PREFIX)}\s*,\s*{re.escape(today_token)}\s*$")
+
+    html = http_get(ASKJIYUN_TODAY_LIST_URL, headers=ASKJIYUN_HEADERS)
+    soup = BeautifulSoup(html, "html.parser")
+
+    candidates: list[tuple[str, str]] = []
+    for a in soup.find_all("a"):
+        title = _clean_title_text(a.get_text(" ", strip=True))
+        href = a.get("href")
+        if not href or "document_srl=" not in href:
+            continue
+        if TITLE_PREFIX not in title:
+            continue
+        post_url = urljoin(BASE, href)
+        candidates.append((title, post_url))
+        if want.search(title):
+            return post_url
+
+    # 폴백: 목록에서 가장 최신 '오늘의 운세' 링크를 사용
+    if candidates:
+        return candidates[0][1]
+    raise RuntimeError("askjiyun.com 목록에서 '오늘의 운세' 게시글 링크를 찾지 못했습니다.")
 
 
 def extract_mk_images(html: str, base_url: str) -> list[str]:
@@ -448,6 +491,7 @@ def _normalize_spacing(text: str) -> str:
     # 5) '년생' 등에서 불필요한 공백 제거
     out = re.sub(r"(\d)\s*,\s*(\d)", r"\1, \2", out)
     out = re.sub(r"(\d)\s+년생", r"\1년생", out)
+    out = re.sub(r"(\d+)\s*월\s*(\d+)\s*일", r"\1월 \2일", out)
 
     # 6) 괄호, 꺽쇠 주변 공백 정리
     out = re.sub(r"\s*\(\s*", " (", out)
@@ -468,58 +512,96 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="매일경제 오늘의 운세 전송기 (개인용)")
     parser.add_argument("--dry-run", action="store_true", help="웹훅으로 전송하지 않고 결과를 콘솔에 출력합니다.")
     parser.add_argument("--debug", action="store_true", help="디버그 로깅을 활성화")
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument("--mk-only", action="store_true", help="매일경제 운세만 전송/출력합니다.")
+    src.add_argument("--jiyun-only", action="store_true", help="askjiyun.com 운세만 전송/출력합니다.")
     # keep only the essential flags
     args = parser.parse_args(argv)
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    logging.info("시작: 매일경제 오늘의 운세 전송")
+    which = "both"
+    if args.mk_only:
+        which = "mk"
+    elif args.jiyun_only:
+        which = "jiyun"
+    logging.info("시작: 오늘의 운세 전송 (%s)", which)
 
     # robots 체크 (선택) — 개인용이라면 실패 시에도 계속 진행하도록 True 반환
-    if not allowed_by_robots(SEARCH_URL, MK_BASE):
+    if which in ("both", "mk") and not allowed_by_robots(SEARCH_URL, MK_BASE):
         logging.warning("robots.txt에서 크롤링을 금지했을 가능성이 있습니다. 계속 진행하려면 코드를 수정하세요.")
-        # 계속 진행하려면 주석처리하거나 허용으로 변경하세요.
-        # return
+    if which in ("both", "jiyun") and not allowed_by_robots(ASKJIYUN_TODAY_LIST_URL, BASE):
+        logging.warning("robots.txt에서 크롤링을 금지했을 가능성이 있습니다. 계속 진행하려면 코드를 수정하세요.")
 
-    post_url = find_today_post_url()
-    logging.info("찾은 게시글 URL: %s", post_url)
+    jobs = []
 
-    # 게시글 요청/파싱
-    html = http_get(post_url)
-    soup = BeautifulSoup(html, "html.parser")
+    if which in ("both", "mk"):
+        post_url = find_today_post_url()
+        logging.info("MK 게시글 URL: %s", post_url)
 
-    page_title = None
-    og = soup.select_one('meta[property="og:title"]')
-    if og and og.get("content"):
-        page_title = og.get("content").strip()
-    if not page_title:
-        page_title = (soup.find("title").get_text(strip=True) if soup.find("title") else TITLE_PREFIX)
+        html = http_get(post_url, headers=MK_HEADERS)
+        soup = BeautifulSoup(html, "html.parser")
 
-    image_urls = extract_mk_images(html, post_url)
+        page_title = None
+        og = soup.select_one('meta[property="og:title"]')
+        if og and og.get("content"):
+            page_title = og.get("content").strip()
+        if not page_title:
+            page_title = (soup.find("title").get_text(strip=True) if soup.find("title") else TITLE_PREFIX)
 
-    # 이미지 카드 전송 시에는 카드 헤더에 제목/링크를 넣으므로,
-    # 본문 메시지에는 중복으로 넣지 않는다.
-    message = "" if image_urls else f"🔮 {page_title}\n{post_url}"
+        image_urls = extract_mk_images(html, post_url)
+        message = "" if image_urls else f"🔮 {page_title}\n{post_url}"
+        jobs.append(
+            {
+                "title": page_title,
+                "url": post_url,
+                "message": message,
+                "image_urls": image_urls,
+            }
+        )
 
-    # 길이 제한 처리
-    if len(message) > MAX_MESSAGE_LEN:
-        logging.warning("메시지가 너무 깁니다 (%d자). 자릅니다.", len(message))
-        message = message[:MAX_MESSAGE_LEN] + "\n\n(메시지가 길어 일부만 전송됩니다. 원문에서 전체 확인하세요.)"
+    if which in ("both", "jiyun"):
+        post_url = find_askjiyun_today_post_url()
+        logging.info("askjiyun 게시글 URL: %s", post_url)
+
+        html = http_get(post_url, headers=ASKJIYUN_HEADERS)
+        soup = BeautifulSoup(html, "html.parser")
+        page_title = (soup.find("title").get_text(strip=True) if soup.find("title") else "askjiyun 오늘의 운세")
+        # 본문 파싱/정리
+        text = parse_post(html)
+        text = _normalize_spacing(_strip_trailing_boilerplate(text))
+        message = f"🔮 {page_title}\n{post_url}\n\n{text}".strip()
+        jobs.append(
+            {
+                "title": page_title,
+                "url": post_url,
+                "message": message,
+                "image_urls": [],
+            }
+        )
+
+    # 길이 제한 처리(각 메시지별)
+    for j in jobs:
+        if len(j["message"]) > MAX_MESSAGE_LEN:
+            logging.warning("메시지가 너무 깁니다 (%d자). 자릅니다.", len(j["message"]))
+            j["message"] = j["message"][:MAX_MESSAGE_LEN] + "\n\n(메시지가 길어 일부만 전송됩니다. 원문에서 전체 확인하세요.)"
 
     if args.dry_run:
-        # dry-run: 웹훅 전송을 하지 않고 출력
         logging.info("Dry-run: 웹훅 전송을 건너뜁니다. 출력으로 대신합니다.")
-        if image_urls:
-            print(f"🔮 {page_title}\n{post_url}")
-        else:
-            print(message)
-        if image_urls:
-            print("\n[images]")
-            for u in image_urls:
-                print(u)
+        for j in jobs:
+            if j["image_urls"]:
+                print(f"🔮 {j['title']}\n{j['url']}")
+                print("\n[images]")
+                for u in j["image_urls"]:
+                    print(u)
+                print()
+            else:
+                print(j["message"])
+                print()
     else:
-        send_to_gchat(message, title=page_title, link_url=post_url, image_urls=image_urls)
+        for j in jobs:
+            send_to_gchat(j["message"], title=j["title"], link_url=j["url"], image_urls=j["image_urls"])
         logging.info("완료.")
 
 
