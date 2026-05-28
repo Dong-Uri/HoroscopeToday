@@ -2,8 +2,9 @@ name: daily-horoscope-gchat
 
 on:
   schedule:
-    # 매일 20:55 UTC = KST(+9) 익일 05:55
-    - cron: "55 20 * * *"
+    # GitHub Actions schedule target: 매일 19:55 UTC = KST(+9) 익일 04:55
+    # 실제 시작은 GitHub Actions 큐 지연으로 늦어질 수 있음.
+    - cron: "55 19 * * *"
   workflow_dispatch: {}
 
 jobs:
