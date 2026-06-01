@@ -15,7 +15,7 @@ import time
 import logging
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin
 from typing import Optional, List
 
 import requests
@@ -405,15 +405,6 @@ def parse_post(html, debug=False):
     return text
 
 
-# ---------- Google Chat 전송 ----------
-def _with_gchat_thread_options(webhook_url: str) -> str:
-    parts = urlsplit(webhook_url)
-    params = dict(parse_qsl(parts.query, keep_blank_values=True))
-    params.pop("threadKey", None)
-    params.setdefault("messageReplyOption", GCHAT_MESSAGE_REPLY_OPTION)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment))
-
-
 def send_to_gchat(
     message: str,
     *,
@@ -450,6 +441,10 @@ def send_to_gchat(
         payload = {"text": message}
     if GCHAT_THREAD_KEY:
         payload["thread"] = {"threadKey": GCHAT_THREAD_KEY}
+    query_params = {}
+    if GCHAT_THREAD_KEY:
+        query_params["threadKey"] = GCHAT_THREAD_KEY
+        query_params["messageReplyOption"] = GCHAT_MESSAGE_REPLY_OPTION
     # 디버그용: 페이로드를 로깅 (실제 전송 전 확인 가능)
     # 메시지 메트릭 로깅: 길이와 개행 개수
     nl_count = message.count("\n")
@@ -463,7 +458,7 @@ def send_to_gchat(
     )
     logging.debug("GChat payload JSON: %s", payload)
     try:
-        r = requests.post(_with_gchat_thread_options(GCHAT_WEBHOOK), json=payload, timeout=20)
+        r = requests.post(GCHAT_WEBHOOK, params=query_params, json=payload, timeout=20)
     except Exception as e:
         logging.exception("GChat POST 실패: %s", e)
         raise
