@@ -412,7 +412,6 @@ def send_to_gchat(
     link_url: Optional[str] = None,
     image_urls: Optional[List[str]] = None,
     thread_key: Optional[str] = None,
-    is_reply: bool = False,
 ):
     if not GCHAT_WEBHOOK:
         raise RuntimeError("환경변수 GCHAT_WEBHOOK이 설정되어 있지 않습니다.")
@@ -444,19 +443,19 @@ def send_to_gchat(
     if thread_key:
         payload["thread"] = {"threadKey": thread_key}
     query_params = {}
-    if thread_key and is_reply:
+    if thread_key:
+        query_params["threadKey"] = thread_key
         query_params["messageReplyOption"] = GCHAT_MESSAGE_REPLY_OPTION
     # 디버그용: 페이로드를 로깅 (실제 전송 전 확인 가능)
     # 메시지 메트릭 로깅: 길이와 개행 개수
     nl_count = message.count("\n")
     logging.info(
-        "Sending to GChat: message length=%d chars, newlines=%d, title=%s, link=%s, images=%d, is_reply=%s",
+        "Sending to GChat: message length=%d chars, newlines=%d, title=%s, link=%s, images=%d",
         len(message),
         nl_count,
         bool(title),
         bool(link_url),
         len(image_urls),
-        is_reply,
     )
     logging.debug("GChat payload JSON: %s", payload)
     try:
@@ -758,8 +757,8 @@ def main(argv=None):
                 print()
     else:
         thread_title, thread_key = _today_chat_thread()
-        send_to_gchat(thread_title, thread_key=thread_key, is_reply=False)
-        time.sleep(1)
+        send_to_gchat(thread_title, thread_key=thread_key)
+        time.sleep(1.5)
         for j in jobs:
             send_to_gchat(
                 j["message"],
@@ -767,7 +766,6 @@ def main(argv=None):
                 link_url=j.get("url"),
                 image_urls=j["image_urls"],
                 thread_key=thread_key,
-                is_reply=True,
             )
         logging.info("완료.")
 
