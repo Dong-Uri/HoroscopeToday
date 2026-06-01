@@ -448,6 +448,8 @@ def send_to_gchat(
         payload = {"cards": [{"sections": [{"widgets": widgets}]}]}
     else:
         payload = {"text": message}
+    if GCHAT_THREAD_KEY:
+        payload["thread"] = {"threadKey": GCHAT_THREAD_KEY}
     # 디버그용: 페이로드를 로깅 (실제 전송 전 확인 가능)
     # 메시지 메트릭 로깅: 길이와 개행 개수
     nl_count = message.count("\n")
