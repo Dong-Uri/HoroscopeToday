@@ -33,7 +33,7 @@ ASKJIYUN_TODAY_LIST_URL = urljoin(BASE, "/today")
 # - 오늘의 운세 2025년 12월 13일 土(음력 10월 24일)·2025년 12월 14일 日(음력 10월 25일)
 TITLE_PREFIX = "오늘의 운세"
 GCHAT_WEBHOOK = os.getenv("GCHAT_WEBHOOK")
-GCHAT_THREAD_KEY = os.getenv("GCHAT_THREAD_KEY", "today_horoscope")
+GCHAT_THREAD_KEY = os.getenv("GCHAT_THREAD_KEY")
 GCHAT_MESSAGE_REPLY_OPTION = os.getenv("GCHAT_MESSAGE_REPLY_OPTION", "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD")
 
 # 전송 최대 길이: 너무 길면 웹훅/채널에서 문제될 수 있으므로 안전하게 자름
@@ -411,6 +411,7 @@ def send_to_gchat(
     title: Optional[str] = None,
     link_url: Optional[str] = None,
     image_urls: Optional[List[str]] = None,
+    thread_key: Optional[str] = None,
 ):
     if not GCHAT_WEBHOOK:
         raise RuntimeError("환경변수 GCHAT_WEBHOOK이 설정되어 있지 않습니다.")
@@ -439,11 +440,11 @@ def send_to_gchat(
         payload = {"cards": [{"sections": [{"widgets": widgets}]}]}
     else:
         payload = {"text": message}
-    if GCHAT_THREAD_KEY:
-        payload["thread"] = {"threadKey": GCHAT_THREAD_KEY}
+    if thread_key:
+        payload["thread"] = {"threadKey": thread_key}
     query_params = {}
-    if GCHAT_THREAD_KEY:
-        query_params["threadKey"] = GCHAT_THREAD_KEY
+    if thread_key:
+        query_params["threadKey"] = thread_key
         query_params["messageReplyOption"] = GCHAT_MESSAGE_REPLY_OPTION
     # 디버그용: 페이로드를 로깅 (실제 전송 전 확인 가능)
     # 메시지 메트릭 로깅: 길이와 개행 개수
@@ -467,6 +468,13 @@ def send_to_gchat(
         logging.error("GChat 전송 실패: %d %s", r.status_code, r.text)
     r.raise_for_status()
     logging.info("Google Chat 전송 성공: %d", r.status_code)
+
+
+def _today_chat_thread() -> tuple[str, str]:
+    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    title = f"{today.month}/{today.day} 운세"
+    thread_key = GCHAT_THREAD_KEY or f"horoscope_{today.isoformat()}"
+    return title, thread_key
 
 
 def _strip_trailing_boilerplate(text: str) -> str:
@@ -727,6 +735,10 @@ def main(argv=None):
 
     if args.dry_run:
         logging.info("Dry-run: 웹훅 전송을 건너뜁니다. 출력으로 대신합니다.")
+        thread_title, thread_key = _today_chat_thread()
+        print(f"[thread title] {thread_title}")
+        print(f"[thread key] {thread_key}")
+        print()
         for j in jobs:
             if j["image_urls"]:
                 if j.get("is_combined"):
@@ -744,8 +756,16 @@ def main(argv=None):
                 print(j["message"])
                 print()
     else:
+        thread_title, thread_key = _today_chat_thread()
+        send_to_gchat(thread_title, thread_key=thread_key)
         for j in jobs:
-            send_to_gchat(j["message"], title=j["title"], link_url=j.get("url"), image_urls=j["image_urls"])
+            send_to_gchat(
+                j["message"],
+                title=j["title"],
+                link_url=j.get("url"),
+                image_urls=j["image_urls"],
+                thread_key=thread_key,
+            )
         logging.info("완료.")
 
 
