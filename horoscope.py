@@ -15,7 +15,7 @@ import time
 import logging
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from typing import Optional, List
 
 import requests
@@ -33,6 +33,8 @@ ASKJIYUN_TODAY_LIST_URL = urljoin(BASE, "/today")
 # - 오늘의 운세 2025년 12월 13일 土(음력 10월 24일)·2025년 12월 14일 日(음력 10월 25일)
 TITLE_PREFIX = "오늘의 운세"
 GCHAT_WEBHOOK = os.getenv("GCHAT_WEBHOOK")
+GCHAT_THREAD_KEY = os.getenv("GCHAT_THREAD_KEY", "today_horoscope")
+GCHAT_MESSAGE_REPLY_OPTION = os.getenv("GCHAT_MESSAGE_REPLY_OPTION", "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD")
 
 # 전송 최대 길이: 너무 길면 웹훅/채널에서 문제될 수 있으므로 안전하게 자름
 MAX_MESSAGE_LEN = 14000
@@ -404,6 +406,14 @@ def parse_post(html, debug=False):
 
 
 # ---------- Google Chat 전송 ----------
+def _with_gchat_thread_options(webhook_url: str) -> str:
+    parts = urlsplit(webhook_url)
+    params = dict(parse_qsl(parts.query, keep_blank_values=True))
+    params.setdefault("threadKey", GCHAT_THREAD_KEY)
+    params.setdefault("messageReplyOption", GCHAT_MESSAGE_REPLY_OPTION)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment))
+
+
 def send_to_gchat(
     message: str,
     *,
@@ -414,6 +424,9 @@ def send_to_gchat(
     if not GCHAT_WEBHOOK:
         raise RuntimeError("환경변수 GCHAT_WEBHOOK이 설정되어 있지 않습니다.")
     image_urls = image_urls or []
+
+    if not message and not image_urls and not title and not link_url:
+        raise ValueError("전송할 내용이 없습니다 (message/image_urls/title/link_url 모두 비어있음).")
 
     # 기본은 text 메시지로 보내되, 이미지가 있으면 카드로 보냄.
     if image_urls:
@@ -438,10 +451,17 @@ def send_to_gchat(
     # 디버그용: 페이로드를 로깅 (실제 전송 전 확인 가능)
     # 메시지 메트릭 로깅: 길이와 개행 개수
     nl_count = message.count("\n")
-    logging.info("Sending to GChat: message length=%d chars, newlines=%d", len(message), nl_count)
+    logging.info(
+        "Sending to GChat: message length=%d chars, newlines=%d, title=%s, link=%s, images=%d",
+        len(message),
+        nl_count,
+        bool(title),
+        bool(link_url),
+        len(image_urls),
+    )
     logging.debug("GChat payload JSON: %s", payload)
     try:
-        r = requests.post(GCHAT_WEBHOOK, json=payload, timeout=20)
+        r = requests.post(_with_gchat_thread_options(GCHAT_WEBHOOK), json=payload, timeout=20)
     except Exception as e:
         logging.exception("GChat POST 실패: %s", e)
         raise
@@ -697,6 +717,10 @@ def main(argv=None):
             jobs.append(mk_job)
         if jiyun_job:
             jobs.append(jiyun_job)
+
+    if not jobs:
+        logging.warning("전송할 job이 없습니다. (MK=%s, askjiyun=%s)", bool(mk_job), bool(jiyun_job))
+        return
 
     # 길이 제한 처리(각 메시지별)
     for j in jobs:
