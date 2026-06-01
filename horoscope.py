@@ -409,7 +409,7 @@ def parse_post(html, debug=False):
 def _with_gchat_thread_options(webhook_url: str) -> str:
     parts = urlsplit(webhook_url)
     params = dict(parse_qsl(parts.query, keep_blank_values=True))
-    params.setdefault("threadKey", GCHAT_THREAD_KEY)
+    params.pop("threadKey", None)
     params.setdefault("messageReplyOption", GCHAT_MESSAGE_REPLY_OPTION)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment))
 
